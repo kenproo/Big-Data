@@ -2,6 +2,14 @@ from functools import reduce
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    DoubleType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 from steam_bigdata.common.config import (
     SILVER_REVIEWS,
@@ -11,6 +19,30 @@ from steam_bigdata.common.config import (
 )
 from steam_bigdata.common.io import read_parquet, write_parquet
 from steam_bigdata.common.spark_config import apply_spark_tuning
+
+
+HISTOGRAM_SCHEMA = StructType([
+    StructField("table_name", StringType(), True),
+    StructField("column_name", StringType(), True),
+    StructField("bucket_start", DoubleType(), True),
+    StructField("bucket_end", DoubleType(), True),
+    StructField("bucket_size", DoubleType(), True),
+    StructField("bin_count", LongType(), True),
+    StructField("created_at", TimestampType(), True),
+])
+
+
+def empty_histogram_df(spark):
+    return spark.createDataFrame([], HISTOGRAM_SCHEMA)
+
+
+def safe_read_parquet(spark, path):
+    try:
+        return read_parquet(spark, path)
+    except Exception as e:
+        print(f"[WARN] Cannot read path: {path}")
+        print(f"[WARN] {e}")
+        return None
 
 
 def build_histogram(df, table_name, column_name, bucket_size, max_value=None):
@@ -30,8 +62,8 @@ def build_histogram(df, table_name, column_name, bucket_size, max_value=None):
         work_df
         .withColumn("bucket_start", bucket_col)
         .groupBy("bucket_start")
-        .agg(F.count("*").alias("bin_count"))
-        .withColumn("bucket_end", F.col("bucket_start") + F.lit(bucket_size))
+        .agg(F.count("*").cast("long").alias("bin_count"))
+        .withColumn("bucket_end", F.col("bucket_start") + F.lit(float(bucket_size)))
         .withColumn("table_name", F.lit(table_name))
         .withColumn("column_name", F.lit(column_name))
         .withColumn("bucket_size", F.lit(float(bucket_size)))
@@ -54,7 +86,10 @@ def build_histogram(df, table_name, column_name, bucket_size, max_value=None):
 def build_dataset_histograms(spark, table_name, path, specs):
     print(f"=== START HISTOGRAMS: {table_name} ===")
 
-    df = read_parquet(spark, path)
+    df = safe_read_parquet(spark, path)
+    if df is None:
+        return empty_histogram_df(spark)
+
     frames = []
 
     for spec in specs:
@@ -74,18 +109,7 @@ def build_dataset_histograms(spark, table_name, path, specs):
             frames.append(hist_df)
 
     if not frames:
-        return spark.createDataFrame(
-            [],
-            schema="""
-                table_name string,
-                column_name string,
-                bucket_start double,
-                bucket_end double,
-                bucket_size double,
-                bin_count long,
-                created_at timestamp
-            """,
-        )
+        return empty_histogram_df(spark)
 
     result = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), frames)
 
@@ -140,9 +164,12 @@ def main(spark):
         ),
     ]
 
-    result = frames[0]
-    for f in frames[1:]:
-        result = result.unionByName(f, allowMissingColumns=True)
+    non_empty_frames = [f for f in frames if f is not None]
+
+    if not non_empty_frames:
+        result = empty_histogram_df(spark)
+    else:
+        result = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), non_empty_frames)
 
     write_parquet(
         result,
@@ -156,4 +183,7 @@ def main(spark):
 
 if __name__ == "__main__":
     spark = SparkSession.builder.appName("silver-quality-histograms").getOrCreate()
-    main(spark)
+    try:
+        main(spark)
+    finally:
+        spark.stop()

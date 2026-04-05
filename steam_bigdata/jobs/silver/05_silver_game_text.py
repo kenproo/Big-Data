@@ -1,5 +1,7 @@
 from pyspark.sql import functions as F
 from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
+
 from steam_bigdata.common.config import (
     BRONZE_PARQUET_STEAM_DESCRIPTIONS,
     SILVER_GAME_TEXT,
@@ -15,7 +17,6 @@ from steam_bigdata.common.outliers import (
     flag_upper_quantile_outliers,
     add_is_outlier_flag,
 )
-
 
 TEXT_HARD_MAX_LEN = 200000
 
@@ -38,21 +39,52 @@ def main(spark):
     df = ensure_reason_cols(df)
     df = add_issue(df, F.col("app_id").isNull(), "missing_app_id")
 
+    if all(c in df.columns for c in ["summary_clean", "extensive_clean", "about_clean"]):
+        df = add_issue(
+            df,
+            (
+                (F.col("summary_clean").isNull() | (F.col("summary_clean") == "")) &
+                (F.col("extensive_clean").isNull() | (F.col("extensive_clean") == "")) &
+                (F.col("about_clean").isNull() | (F.col("about_clean") == ""))
+            ),
+            "all_text_fields_empty"
+        )
+
     for c in ["summary_len", "extensive_len", "about_len"]:
         if c in df.columns:
             df = add_hard_upper_limit_issue(df, c, TEXT_HARD_MAX_LEN)
 
-    df = df.dropDuplicates(["app_id"])
+    w = Window.partitionBy("app_id").orderBy(F.lit(1))
+    df = df.withColumn("rn_app_id", F.row_number().over(w))
+    df = add_issue(
+        df,
+        F.col("app_id").isNotNull() & (F.col("rn_app_id") > 1),
+        "duplicate_app_id"
+    )
 
     invalid_df = df.filter(F.col("quality_issue").isNotNull())
     valid_df = df.filter(F.col("quality_issue").isNull())
 
     outlier_cols = [c for c in ["summary_len", "extensive_len", "about_len"] if c in valid_df.columns]
-    valid_df = flag_upper_quantile_outliers(valid_df, outlier_cols, quantile=0.999, rel_error=0.01)
-    valid_df = add_is_outlier_flag(valid_df)
+    if outlier_cols:
+        valid_df = flag_upper_quantile_outliers(valid_df, outlier_cols, quantile=0.999, rel_error=0.01)
+        valid_df = add_is_outlier_flag(valid_df)
+    else:
+        valid_df = valid_df.withColumn("is_outlier", F.lit(False))
+
+    if "rn_app_id" in valid_df.columns:
+        valid_df = valid_df.drop("rn_app_id")
+    if "rn_app_id" in invalid_df.columns:
+        invalid_df = invalid_df.drop("rn_app_id")
+
+    valid_df = valid_df.withColumn("silver_processed_at", F.current_timestamp())
+    invalid_df = invalid_df.withColumn("silver_processed_at", F.current_timestamp())
 
     write_parquet(valid_df, SILVER_GAME_TEXT, mode="overwrite", num_partitions=40)
     write_parquet(invalid_df, f"{SILVER_REJECTED_ROOT}/game_text", mode="overwrite", num_partitions=10)
+
+
 if __name__ == "__main__":
     spark = SparkSession.builder.appName("silver-game-text").getOrCreate()
     main(spark)
+    spark.stop()

@@ -2,6 +2,14 @@ from functools import reduce
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    DoubleType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 from steam_bigdata.common.config import (
     BRONZE_PARQUET_ALL_REVIEWS,
@@ -16,7 +24,6 @@ from steam_bigdata.common.io import read_parquet, write_parquet
 from steam_bigdata.common.spark_config import apply_spark_tuning
 
 
-# Chỉ profile các cột quan trọng để tránh job quá nặng
 PROFILE_COLUMNS = {
     "reviews": [
         "review_id",
@@ -60,6 +67,35 @@ PROFILE_COLUMNS = {
 }
 
 
+COLUMN_SCHEMA = StructType([
+    StructField("table_name", StringType(), True),
+    StructField("column_name", StringType(), True),
+    StructField("bronze_row_count", LongType(), True),
+    StructField("silver_row_count", LongType(), True),
+    StructField("bronze_null_count", LongType(), True),
+    StructField("silver_null_count", LongType(), True),
+    StructField("bronze_null_rate", DoubleType(), True),
+    StructField("silver_null_rate", DoubleType(), True),
+    StructField("null_rate_improvement", DoubleType(), True),
+    StructField("bronze_distinct_count", LongType(), True),
+    StructField("silver_distinct_count", LongType(), True),
+    StructField("created_at", TimestampType(), True),
+])
+
+
+def empty_column_df(spark):
+    return spark.createDataFrame([], COLUMN_SCHEMA)
+
+
+def safe_read_parquet(spark, path):
+    try:
+        return read_parquet(spark, path)
+    except Exception as e:
+        print(f"[WARN] Cannot read path: {path}")
+        print(f"[WARN] {e}")
+        return None
+
+
 def profile_columns(df, table_name, layer_name, use_approx_distinct=True):
     existing_cols = [c for c in PROFILE_COLUMNS.get(table_name, []) if c in df.columns]
 
@@ -77,17 +113,16 @@ def profile_columns(df, table_name, layer_name, use_approx_distinct=True):
             """,
         )
 
-    # 1 lần count cho cả bảng
     row_count = df.count()
-
     frames = []
+
     for c in existing_cols:
         col_expr = F.col(c)
 
         if use_approx_distinct:
-            distinct_expr = F.approx_count_distinct(col_expr).alias("distinct_count")
+            distinct_expr = F.approx_count_distinct(col_expr).cast("long").alias("distinct_count")
         else:
-            distinct_expr = F.countDistinct(col_expr).alias("distinct_count")
+            distinct_expr = F.countDistinct(col_expr).cast("long").alias("distinct_count")
 
         metric_df = (
             df.agg(
@@ -114,16 +149,19 @@ def profile_columns(df, table_name, layer_name, use_approx_distinct=True):
         )
         frames.append(metric_df)
 
-    return reduce(lambda a, b: a.unionByName(b), frames)
+    return reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), frames)
 
 
 def compare_columns(spark, table_name, bronze_path, silver_path):
     print(f"=== START COLUMN PROFILE: {table_name} ===")
 
-    bronze_df = read_parquet(spark, bronze_path)
-    silver_df = read_parquet(spark, silver_path)
+    bronze_df = safe_read_parquet(spark, bronze_path)
+    silver_df = safe_read_parquet(spark, silver_path)
 
-    # Bronze giữ approx distinct để nhẹ hơn
+    if bronze_df is None or silver_df is None:
+        print(f"[WARN] Missing bronze/silver path for {table_name}, return empty.")
+        return empty_column_df(spark)
+
     bronze_profile = profile_columns(
         bronze_df,
         table_name=table_name,
@@ -131,7 +169,6 @@ def compare_columns(spark, table_name, bronze_path, silver_path):
         use_approx_distinct=True,
     )
 
-    # Silver cũng approx distinct cho ổn định chi phí
     silver_profile = profile_columns(
         silver_df,
         table_name=table_name,
@@ -182,6 +219,7 @@ def compare_columns(spark, table_name, bronze_path, silver_path):
             "silver_distinct_count",
             "created_at",
         )
+        .orderBy("table_name", "column_name")
     )
 
     print(f"=== END COLUMN PROFILE: {table_name} ===")
@@ -204,9 +242,12 @@ def main(spark):
         for table_name, bronze_path, silver_path in datasets
     ]
 
-    result = frames[0]
-    for f in frames[1:]:
-        result = result.unionByName(f, allowMissingColumns=True)
+    non_empty_frames = [f for f in frames if f is not None]
+
+    if not non_empty_frames:
+        result = empty_column_df(spark)
+    else:
+        result = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), non_empty_frames)
 
     write_parquet(
         result,
@@ -220,4 +261,7 @@ def main(spark):
 
 if __name__ == "__main__":
     spark = SparkSession.builder.appName("silver-quality-columns").getOrCreate()
-    main(spark)
+    try:
+        main(spark)
+    finally:
+        spark.stop()

@@ -1,5 +1,15 @@
+from functools import reduce
+
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    DoubleType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 from steam_bigdata.common.config import (
     BRONZE_PARQUET_ALL_REVIEWS,
@@ -12,47 +22,74 @@ from steam_bigdata.common.io import read_parquet, write_parquet
 from steam_bigdata.common.spark_config import apply_spark_tuning
 
 
+ISSUE_SCHEMA = StructType([
+    StructField("table_name", StringType(), True),
+    StructField("issue_name", StringType(), True),
+    StructField("issue_count", LongType(), True),
+    StructField("issue_rate_on_bronze", DoubleType(), True),
+    StructField("issue_rate_on_rejected", DoubleType(), True),
+    StructField("created_at", TimestampType(), True),
+])
+
+
+def empty_issue_df(spark):
+    return spark.createDataFrame([], ISSUE_SCHEMA)
+
+
+def safe_read_parquet(spark, path):
+    try:
+        return read_parquet(spark, path)
+    except Exception as e:
+        print(f"[WARN] Cannot read path: {path}")
+        print(f"[WARN] {e}")
+        return None
+
+
 def build_issue_metrics(spark, table_name, bronze_path, rejected_path):
     print(f"=== START ISSUES: {table_name} ===")
+    print(f"BRONZE PATH   = {bronze_path}")
+    print(f"REJECTED PATH = {rejected_path}")
 
-    bronze_df = read_parquet(spark, bronze_path)
-    rejected_df = read_parquet(spark, rejected_path)
+    bronze_df = safe_read_parquet(spark, bronze_path)
+    rejected_df = safe_read_parquet(spark, rejected_path)
+
+    if bronze_df is None:
+        print(f"[WARN] Missing bronze data for {table_name}, return empty.")
+        return empty_issue_df(spark)
 
     bronze_count = bronze_df.count()
 
+    if rejected_df is None:
+        print(f"[WARN] Missing rejected data for {table_name}, return empty.")
+        return empty_issue_df(spark)
+
     if "quality_issue" not in rejected_df.columns:
-        return spark.createDataFrame(
-            [],
-            schema="""
-                table_name string,
-                issue_name string,
-                issue_count long,
-                issue_rate_on_bronze double,
-                issue_rate_on_rejected double,
-                created_at timestamp
-            """,
-        )
+        print(f"[WARN] quality_issue column not found in rejected {table_name}, return empty.")
+        return empty_issue_df(spark)
+
+    rejected_total = rejected_df.count()
+    if rejected_total == 0:
+        print(f"[WARN] rejected_df is empty for {table_name}, return empty.")
+        return empty_issue_df(spark)
 
     issue_col = F.col("quality_issue")
 
     issue_array = (
         F.when(issue_col.isNull(), F.array().cast("array<string>"))
-        .when(issue_col.cast("string").contains(","), F.split(issue_col.cast("string"), r"\s*,\s*"))
+        .when(F.instr(issue_col.cast("string"), ",") > 0, F.split(issue_col.cast("string"), r"\s*,\s*"))
         .otherwise(F.array(issue_col.cast("string")))
     )
 
     exploded = (
         rejected_df
         .withColumn("issue_name", F.explode(issue_array))
-        .filter(F.col("issue_name").isNotNull() & (F.trim(F.col("issue_name")) != ""))
+        .withColumn("issue_name", F.trim(F.col("issue_name")))
+        .filter(F.col("issue_name").isNotNull() & (F.col("issue_name") != ""))
     )
-
-    rejected_count_df = rejected_df.agg(F.count("*").alias("rejected_total"))
 
     result = (
         exploded.groupBy("issue_name")
-        .agg(F.count("*").alias("issue_count"))
-        .crossJoin(rejected_count_df)
+        .agg(F.count("*").cast("long").alias("issue_count"))
         .withColumn("table_name", F.lit(table_name))
         .withColumn(
             "issue_rate_on_bronze",
@@ -60,7 +97,7 @@ def build_issue_metrics(spark, table_name, bronze_path, rejected_path):
         )
         .withColumn(
             "issue_rate_on_rejected",
-            F.when(F.col("rejected_total") > 0, F.col("issue_count") / F.col("rejected_total")).otherwise(F.lit(0.0)),
+            F.when(F.lit(rejected_total) > 0, F.col("issue_count") / F.lit(rejected_total)).otherwise(F.lit(0.0)),
         )
         .withColumn("created_at", F.current_timestamp())
         .select(
@@ -71,7 +108,7 @@ def build_issue_metrics(spark, table_name, bronze_path, rejected_path):
             "issue_rate_on_rejected",
             "created_at",
         )
-        .orderBy(F.desc("issue_count"))
+        .orderBy(F.desc("issue_count"), F.asc("issue_name"))
     )
 
     print(f"=== END ISSUES: {table_name} ===")
@@ -94,9 +131,12 @@ def main(spark):
         for table_name, bronze_path, rejected_path in datasets
     ]
 
-    result = frames[0]
-    for f in frames[1:]:
-        result = result.unionByName(f, allowMissingColumns=True)
+    non_empty_frames = [f for f in frames if f is not None]
+
+    if not non_empty_frames:
+        result = empty_issue_df(spark)
+    else:
+        result = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), non_empty_frames)
 
     write_parquet(
         result,
@@ -110,4 +150,7 @@ def main(spark):
 
 if __name__ == "__main__":
     spark = SparkSession.builder.appName("silver-quality-issues").getOrCreate()
-    main(spark)
+    try:
+        main(spark)
+    finally:
+        spark.stop()

@@ -1,8 +1,8 @@
-PROJECT_ID = "project-79499e5c-69d7-42b8-864"
-REGION = "asia-southeast1"
+PROJECT_ID = "YOUR_PROJECT_ID"
+REGION = "YOUR_REGION"
 
-BUCKET = "gs://truong_bigdata_24032026_init"
-BATCH_DATE = "2026-03-24"
+BUCKET = "YOUR_BUCKET"
+BATCH_DATE = "YOUR_BATCH_DATE"
 
 SILVER_ROOT = f"{BUCKET}/silver"
 

@@ -2,12 +2,20 @@ from functools import reduce
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    DoubleType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 from steam_bigdata.common.config import (
     SILVER_REVIEWS,
     SILVER_GAMES,
     SILVER_USERS,
-    SILVER_QUALITY_OUTLIERS,
+    SILVER_QUALITY_OUTLIERS,   # add this in config.py if not exists
 )
 from steam_bigdata.common.io import read_parquet, write_parquet
 from steam_bigdata.common.spark_config import apply_spark_tuning
@@ -19,20 +27,19 @@ OUTLIER_COLUMNS = {
         "author_num_reviews",
         "author_playtime_forever",
         "author_playtime_last_two_weeks",
-        "author_playtime_at_review",
-        "votes_up",
-        "votes_funny",
+        "hours",
+        "helpful",
+        "funny",
         "comment_count",
-        "weighted_vote_score",
         "review_text_length",
     ],
     "games": [
         "price_final",
         "price_original",
         "discount_percent",
+        "required_age",
         "metacritic_score",
         "recommendation_count",
-        "required_age",
     ],
     "users": [
         "products",
@@ -41,98 +48,134 @@ OUTLIER_COLUMNS = {
 }
 
 
-def build_outlier_metrics_for_column(df, table_name, column_name, row_count, rel_error=0.01):
-    # approxQuantile cho từng cột, nhưng chỉ trên vài cột quan trọng
-    q = df.approxQuantile(column_name, [0.95, 0.99, 0.999], rel_error)
+OUTLIER_SCHEMA = StructType([
+    StructField("table_name", StringType(), True),
+    StructField("column_name", StringType(), True),
+    StructField("row_count", LongType(), True),
+    StructField("non_null_count", LongType(), True),
+    StructField("outlier_count", LongType(), True),
+    StructField("outlier_rate", DoubleType(), True),
+    StructField("q1", DoubleType(), True),
+    StructField("q3", DoubleType(), True),
+    StructField("iqr", DoubleType(), True),
+    StructField("lower_bound", DoubleType(), True),
+    StructField("upper_bound", DoubleType(), True),
+    StructField("min_value", DoubleType(), True),
+    StructField("max_value", DoubleType(), True),
+    StructField("mean_value", DoubleType(), True),
+    StructField("created_at", TimestampType(), True),
+])
 
-    p95 = float(q[0]) if len(q) > 0 and q[0] is not None else None
-    p99 = float(q[1]) if len(q) > 1 and q[1] is not None else None
-    p999 = float(q[2]) if len(q) > 2 and q[2] is not None else None
 
-    outlier_expr = (
-        F.sum(F.when(F.col(column_name) > F.lit(p999), 1).otherwise(0)).cast("long").alias("outlier_count")
-        if p999 is not None
-        else F.lit(0).cast("long").alias("outlier_count")
+def empty_outlier_df(spark):
+    return spark.createDataFrame([], OUTLIER_SCHEMA)
+
+
+def safe_read_parquet(spark, path):
+    try:
+        return read_parquet(spark, path)
+    except Exception as e:
+        print(f"[WARN] Cannot read path: {path}")
+        print(f"[WARN] {e}")
+        return None
+
+
+def profile_outliers_for_column(df, table_name, column_name):
+    if column_name not in df.columns:
+        return df.sparkSession.createDataFrame([], OUTLIER_SCHEMA)
+
+    numeric_df = df.select(F.col(column_name).cast("double").alias(column_name))
+    row_count = df.count()
+
+    base_stats = numeric_df.agg(
+        F.count(F.col(column_name)).cast("long").alias("non_null_count"),
+        F.min(F.col(column_name)).cast("double").alias("min_value"),
+        F.max(F.col(column_name)).cast("double").alias("max_value"),
+        F.avg(F.col(column_name)).cast("double").alias("mean_value"),
+    ).collect()[0]
+
+    non_null_count = base_stats["non_null_count"]
+
+    if non_null_count == 0:
+        return df.sparkSession.createDataFrame(
+            [(
+                table_name,
+                column_name,
+                row_count,
+                0,
+                0,
+                0.0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )],
+            schema=OUTLIER_SCHEMA,
+        )
+
+    q1, q3 = numeric_df.approxQuantile(column_name, [0.25, 0.75], 0.01)
+    iqr = q3 - q1
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+
+    outlier_count = (
+        numeric_df.filter(
+            F.col(column_name).isNotNull() &
+            (
+                (F.col(column_name) < F.lit(lower_bound)) |
+                (F.col(column_name) > F.lit(upper_bound))
+            )
+        )
+        .count()
     )
 
-    return (
-        df.agg(
-            F.sum(F.when(F.col(column_name).isNull(), 1).otherwise(0)).cast("long").alias("null_count"),
-            F.min(F.col(column_name)).cast("double").alias("min_value"),
-            F.max(F.col(column_name)).cast("double").alias("max_value"),
-            F.avg(F.col(column_name)).cast("double").alias("avg_value"),
-            F.stddev(F.col(column_name)).cast("double").alias("stddev_value"),
-            outlier_expr,
-        )
-        .withColumn("table_name", F.lit(table_name))
-        .withColumn("column_name", F.lit(column_name))
-        .withColumn("row_count", F.lit(row_count))
-        .withColumn("p95", F.lit(p95))
-        .withColumn("p99", F.lit(p99))
-        .withColumn("p999", F.lit(p999))
-        .withColumn(
-            "outlier_rate",
-            F.when(F.lit(row_count) > 0, F.col("outlier_count") / F.lit(row_count)).otherwise(F.lit(0.0))
-        )
-        .withColumn("created_at", F.current_timestamp())
-        .select(
-            "table_name",
-            "column_name",
-            "row_count",
-            "null_count",
-            "min_value",
-            "max_value",
-            "avg_value",
-            "stddev_value",
-            "p95",
-            "p99",
-            "p999",
-            "outlier_count",
-            "outlier_rate",
-            "created_at",
-        )
-    )
+    outlier_rate = float(outlier_count / non_null_count) if non_null_count > 0 else 0.0
+
+    return df.sparkSession.createDataFrame(
+        [(
+            table_name,
+            column_name,
+            int(row_count),
+            int(non_null_count),
+            int(outlier_count),
+            float(outlier_rate),
+            float(q1) if q1 is not None else None,
+            float(q3) if q3 is not None else None,
+            float(iqr) if iqr is not None else None,
+            float(lower_bound) if lower_bound is not None else None,
+            float(upper_bound) if upper_bound is not None else None,
+            float(base_stats["min_value"]) if base_stats["min_value"] is not None else None,
+            float(base_stats["max_value"]) if base_stats["max_value"] is not None else None,
+            float(base_stats["mean_value"]) if base_stats["mean_value"] is not None else None,
+            None,
+        )],
+        schema=OUTLIER_SCHEMA,
+    ).withColumn("created_at", F.current_timestamp())
 
 
-def build_outlier_metrics(spark, table_name, path):
+def profile_outliers(spark, df, table_name):
     print(f"=== START OUTLIER PROFILE: {table_name} ===")
 
-    df = read_parquet(spark, path)
     existing_cols = [c for c in OUTLIER_COLUMNS.get(table_name, []) if c in df.columns]
 
     if not existing_cols:
-        return spark.createDataFrame(
-            [],
-            schema="""
-                table_name string,
-                column_name string,
-                row_count long,
-                null_count long,
-                min_value double,
-                max_value double,
-                avg_value double,
-                stddev_value double,
-                p95 double,
-                p99 double,
-                p999 double,
-                outlier_count long,
-                outlier_rate double,
-                created_at timestamp
-            """,
-        )
-
-    # 1 lần count cho cả bảng
-    row_count = df.count()
+        print(f"[WARN] No matching outlier columns for {table_name}")
+        return empty_outlier_df(spark)
 
     frames = [
-        build_outlier_metrics_for_column(df, table_name, c, row_count)
+        profile_outliers_for_column(df, table_name, c)
         for c in existing_cols
     ]
 
-    result = reduce(lambda a, b: a.unionByName(b), frames)
+    result = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), frames)
 
     print(f"=== END OUTLIER PROFILE: {table_name} ===")
-    return result
+    return result.orderBy("table_name", "column_name")
 
 
 def main(spark):
@@ -140,15 +183,24 @@ def main(spark):
 
     print("=== START silver_quality_outliers ===")
 
-    frames = [
-        build_outlier_metrics(spark, "reviews", SILVER_REVIEWS),
-        build_outlier_metrics(spark, "games", SILVER_GAMES),
-        build_outlier_metrics(spark, "users", SILVER_USERS),
+    datasets = [
+        ("reviews", SILVER_REVIEWS),
+        ("games", SILVER_GAMES),
+        ("users", SILVER_USERS),
     ]
 
-    result = frames[0]
-    for f in frames[1:]:
-        result = result.unionByName(f, allowMissingColumns=True)
+    frames = []
+    for table_name, path in datasets:
+        df = safe_read_parquet(spark, path)
+        if df is None:
+            print(f"[WARN] Missing silver path for {table_name}, skip.")
+            continue
+        frames.append(profile_outliers(spark, df, table_name))
+
+    if not frames:
+        result = empty_outlier_df(spark)
+    else:
+        result = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), frames)
 
     write_parquet(
         result,
@@ -162,4 +214,7 @@ def main(spark):
 
 if __name__ == "__main__":
     spark = SparkSession.builder.appName("silver-quality-outliers").getOrCreate()
-    main(spark)
+    try:
+        main(spark)
+    finally:
+        spark.stop()
