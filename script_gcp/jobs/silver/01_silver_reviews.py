@@ -18,7 +18,14 @@ from steam_bigdata.common.outliers import (
     add_is_outlier_flag,
 )
 
+# -------------------- CONFIG --------------------
+MIN_REVIEW_TEXT_LENGTH = 10
+MAX_HOURS = 50000.0
 
+CHECKPOINT_DIR = "gs://truong_bigdata_24032026_init/tmp/checkpoints"
+
+
+# -------------------- UTILS --------------------
 def rename_raw_columns(df):
     rename_map = {
         "recommendationid": "review_id",
@@ -28,6 +35,19 @@ def rename_raw_columns(df):
         "votes_up": "helpful",
         "votes_funny": "funny",
         "review": "review_text",
+
+        # Keep timestamp/date fields as raw values for later BigQuery processing.
+        # Do not parse them in Silver PySpark.
+        "date": "timestamp_created",
+        "created": "timestamp_created",
+        "created_at": "timestamp_created",
+        "review_date": "timestamp_created",
+        "timestamp": "timestamp_created",
+        "time_created": "timestamp_created",
+
+        "updated": "timestamp_updated",
+        "updated_at": "timestamp_updated",
+        "time_updated": "timestamp_updated",
     }
 
     for old_name, new_name in rename_map.items():
@@ -54,6 +74,7 @@ def clean_df(df):
         "helpful",
         "funny",
     ]
+
     for c in long_cols:
         if c in df.columns:
             df = df.withColumn(c, safe_to_long(c))
@@ -62,6 +83,7 @@ def clean_df(df):
         "hours",
         "weighted_vote_score",
     ]
+
     for c in double_cols:
         if c in df.columns:
             df = df.withColumn(c, safe_to_double(c))
@@ -82,20 +104,34 @@ def normalize_boolean_cols(df):
         if c in df.columns:
             df = df.withColumn(
                 c,
-                F.when(F.lower(F.col(c).cast("string")).isin("true", "1", "yes"), F.lit(True))
-                 .when(F.lower(F.col(c).cast("string")).isin("false", "0", "no"), F.lit(False))
-                 .otherwise(F.col(c).cast("boolean"))
+                F.when(
+                    F.lower(F.col(c).cast("string")).isin("true", "1", "yes"),
+                    F.lit(True),
+                )
+                .when(
+                    F.lower(F.col(c).cast("string")).isin("false", "0", "no"),
+                    F.lit(False),
+                )
+                .otherwise(F.col(c).cast("boolean")),
             )
 
     return df
 
 
-def normalize_date_cols(df):
-    if "timestamp_created" in df.columns:
-        df = df.withColumn("timestamp_created", F.to_timestamp("timestamp_created"))
+def keep_timestamp_raw_for_bigquery(df):
+    """
+    Keep timestamp/date columns as raw string values.
+    Timestamp parsing will be handled later in BigQuery.
+    """
 
-    if "timestamp_updated" in df.columns:
-        df = df.withColumn("timestamp_updated", F.to_timestamp("timestamp_updated"))
+    timestamp_cols = [
+        "timestamp_created",
+        "timestamp_updated",
+    ]
+
+    for c in timestamp_cols:
+        if c in df.columns:
+            df = df.withColumn(c, F.col(c).cast("string"))
 
     return df
 
@@ -105,21 +141,22 @@ def add_duplicate_review_issue(df):
         return df
 
     w = Window.partitionBy("review_id")
+
     df = df.withColumn("_review_id_cnt", F.count("*").over(w))
+
     df = add_issue(
         df,
         F.col("review_id").isNotNull() & (F.col("_review_id_cnt") > 1),
         "duplicate_review_id",
     )
+
     return df.drop("_review_id_cnt")
 
 
+# -------------------- MAIN --------------------
 def main(spark):
     apply_spark_tuning(spark)
-
-    spark.sparkContext.setCheckpointDir(
-        "gs://truong_bigdata_24032026_init/tmp/checkpoints"
-    )
+    spark.sparkContext.setCheckpointDir(CHECKPOINT_DIR)
 
     print("=== START silver_reviews ===")
     print(f"INPUT = {BRONZE_PARQUET_ALL_REVIEWS}")
@@ -127,43 +164,80 @@ def main(spark):
     print(f"OUTPUT INVALID = {SILVER_REJECTED_ROOT}/reviews")
 
     df = read_parquet(spark, BRONZE_PARQUET_ALL_REVIEWS)
+
     print("READ DONE")
     print("RAW COLUMNS =", df.columns)
 
     df = rename_raw_columns(df)
+
     print("RENAMED COLUMNS =", df.columns)
+
+    # Debug timestamp/date columns after rename.
+    date_like_cols = [
+        c for c in df.columns
+        if "time" in c.lower()
+        or "date" in c.lower()
+        or "created" in c.lower()
+        or "updated" in c.lower()
+    ]
+    print("DATE/TIME COLUMNS AFTER RENAME =", date_like_cols)
 
     df = clean_df(df)
     df = normalize_boolean_cols(df)
-    df = normalize_date_cols(df)
+
+    # Keep timestamp/date columns raw for later BigQuery processing.
+    # Do not parse timestamp in Silver PySpark job.
+    df = keep_timestamp_raw_for_bigquery(df)
+
     df = ensure_reason_cols(df)
 
-    # add processing timestamp
     df = df.withColumn("silver_processed_at", F.current_timestamp())
 
     print("NORMALIZE DONE")
 
-    # hard key issues
+    # -------------------- HARD KEY ISSUES --------------------
     if "review_id" in df.columns:
         df = add_issue(df, F.col("review_id").isNull(), "missing_review_id")
+    else:
+        df = add_issue(df, F.lit(True), "missing_review_id_column")
 
     if "app_id" in df.columns:
         df = add_issue(df, F.col("app_id").isNull(), "missing_app_id")
+    else:
+        df = add_issue(df, F.lit(True), "missing_app_id_column")
 
     if "user_id" in df.columns:
         df = add_issue(df, F.col("user_id").isNull(), "missing_user_id")
+    else:
+        df = add_issue(df, F.lit(True), "missing_user_id_column")
 
-    # duplicate review_id should go rejected, not silently dropped
     df = add_duplicate_review_issue(df)
 
-    # soft quality issues
+    # -------------------- TEXT QUALITY ISSUES --------------------
     if "review_text" in df.columns:
+        df = df.withColumn(
+            "review_text_length",
+            F.length(F.trim(F.col("review_text"))),
+        )
+
         df = add_issue(
             df,
-            F.col("review_text").isNull() | (F.length(F.trim(F.col("review_text"))) == 0),
+            F.col("review_text").isNull()
+            | (F.length(F.trim(F.col("review_text"))) == 0),
             "empty_review_text",
         )
 
+        df = add_issue(
+            df,
+            F.col("review_text").isNotNull()
+            & (F.length(F.trim(F.col("review_text"))) > 0)
+            & (F.length(F.trim(F.col("review_text"))) < MIN_REVIEW_TEXT_LENGTH),
+            "too_short_review_text",
+        )
+    else:
+        df = add_issue(df, F.lit(True), "missing_review_text_column")
+
+    # -------------------- NUMERIC QUALITY ISSUES --------------------
     for c in [
         "author_num_games_owned",
         "author_num_reviews",
@@ -181,49 +255,17 @@ def main(spark):
                 f"negative_{c}",
             )
 
-    for c in [
-        "is_recommended",
-        "steam_purchase",
-        "received_for_free",
-        "written_during_early_access",
-        "hidden_in_steam_china",
-    ]:
-        if c in df.columns:
-            df = add_issue(
-                df,
-                F.col(c).isNull(),
-                f"invalid_boolean_{c}",
-            )
-
-    ancient_ts_cutoff = F.lit("1900-01-01 00:00:00").cast("timestamp")
-
-    if "timestamp_created" in df.columns:
+    if "hours" in df.columns:
         df = add_issue(
             df,
-            F.col("timestamp_created").isNotNull() & (F.col("timestamp_created") < ancient_ts_cutoff),
-            "ancient_timestamp_created",
-        )
-        df = df.withColumn(
-            "timestamp_created",
-            F.when(
-                F.col("timestamp_created") < ancient_ts_cutoff,
-                F.lit(None).cast("timestamp"),
-            ).otherwise(F.col("timestamp_created"))
+            F.col("hours").isNotNull() & (F.col("hours") > MAX_HOURS),
+            "too_large_hours",
         )
 
-    if "timestamp_updated" in df.columns:
-        df = add_issue(
-            df,
-            F.col("timestamp_updated").isNotNull() & (F.col("timestamp_updated") < ancient_ts_cutoff),
-            "ancient_timestamp_updated",
-        )
-        df = df.withColumn(
-            "timestamp_updated",
-            F.when(
-                F.col("timestamp_updated") < ancient_ts_cutoff,
-                F.lit(None).cast("timestamp"),
-            ).otherwise(F.col("timestamp_updated"))
-        )
+    # -------------------- TIMESTAMP QUALITY ISSUES --------------------
+    # Skipped intentionally.
+    # timestamp_created / timestamp_updated are kept as raw string values
+    # and will be processed later in BigQuery.
 
     if "weighted_vote_score" in df.columns:
         df = add_hard_range_issue(
@@ -236,29 +278,52 @@ def main(spark):
 
     print("ISSUE RULES DONE")
 
-    df = df.repartition(200, "review_id") if "review_id" in df.columns else df.repartition(200)
+    # -------------------- CHECKPOINT --------------------
+    if "review_id" in df.columns:
+        df = df.repartition(200, "review_id")
+    else:
+        df = df.repartition(200)
+
     df = df.checkpoint(eager=False)
+
     print("CHECKPOINT SET")
 
-    # hard reject only on key integrity / duplicates
+    # -------------------- SPLIT VALID / INVALID --------------------
     hard_issue_patterns = [
         "missing_review_id",
+        "missing_review_id_column",
         "missing_app_id",
+        "missing_app_id_column",
         "missing_user_id",
+        "missing_user_id_column",
         "duplicate_review_id",
+        "empty_review_text",
+        "too_short_review_text",
+        "missing_review_text_column",
+        "too_large_hours",
     ]
 
     hard_invalid_condition = F.lit(False)
+
     for pattern in hard_issue_patterns:
-        hard_invalid_condition = hard_invalid_condition | F.col("quality_issue").contains(pattern)
+        hard_invalid_condition = (
+            hard_invalid_condition | F.col("quality_issue").contains(pattern)
+        )
 
-    invalid_df = df.filter(F.col("quality_issue").isNotNull() & hard_invalid_condition).repartition(40)
-    valid_df = df.filter(F.col("quality_issue").isNull() | (~hard_invalid_condition)).repartition(160)
+    invalid_df = (
+        df.filter(F.col("quality_issue").isNotNull() & hard_invalid_condition)
+        .repartition(40)
+    )
 
-    print("SPLIT DONE")
+    valid_df = (
+        df.filter(F.col("quality_issue").isNull() | (~hard_invalid_condition))
+        .repartition(160)
+    )
 
+    # -------------------- OUTLIER PROCESS --------------------
     outlier_cols = [
-        c for c in [
+        c
+        for c in [
             "author_num_games_owned",
             "author_num_reviews",
             "author_playtime_forever",
@@ -278,6 +343,7 @@ def main(spark):
             quantile=0.999,
             rel_error=0.01,
         )
+
         valid_df = cap_upper_quantile(
             valid_df,
             outlier_cols,
@@ -286,8 +352,7 @@ def main(spark):
             suffix="_capped",
         )
 
-    if "review_text" in valid_df.columns:
-        valid_df = valid_df.withColumn("review_text_length", F.length("review_text"))
+    if "review_text_length" in valid_df.columns:
         valid_df = flag_upper_quantile_outliers(
             valid_df,
             ["review_text_length"],
@@ -299,13 +364,15 @@ def main(spark):
 
     print("OUTLIER PROCESS DONE")
 
+    # -------------------- WRITE OVER EXISTING DATA --------------------
     write_parquet(
         valid_df,
         SILVER_REVIEWS,
         mode="overwrite",
         num_partitions=160,
     )
-    print("WRITE VALID DONE")
+
+    print("WRITE VALID DONE - overwrote existing silver_reviews")
 
     write_parquet(
         invalid_df,
@@ -313,8 +380,8 @@ def main(spark):
         mode="overwrite",
         num_partitions=40,
     )
-    print("WRITE INVALID DONE")
 
+    print("WRITE INVALID DONE - overwrote existing rejected reviews")
     print("=== END silver_reviews ===")
 
 
@@ -324,8 +391,11 @@ if __name__ == "__main__":
         .appName("silver-reviews")
         .config("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
         .config("spark.sql.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+        .config("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+        .config("spark.sql.parquet.datetimeRebaseModeInRead", "CORRECTED")
         .getOrCreate()
     )
+
     try:
         main(spark)
     finally:
