@@ -1,29 +1,3 @@
-"""
-generate_minilm_game_text_embeddings.py
-
-Generate MiniLM embeddings for Steam game text.
-
-Mục đích:
-- Đọc bảng BigQuery steam_gold.gold_game_text_features.
-- Lấy app_id và game_text_document.
-- Dùng pretrained multilingual MiniLM để encode text.
-- Ghi embedding ra GCS dưới dạng Parquet.
-- Output dùng để load vào BigQuery:
-  steam_gold.gold_minilm_game_text_embeddings
-
-Model:
-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-
-Cách chạy mẫu trên GPU VM / Colab:
-
-python generate_minilm_game_text_embeddings.py \
-  --project_id project-79499e5c-69d7-42b8-864 \
-  --dataset steam_gold \
-  --source_table gold_game_text_features \
-  --output_path gs://truong_bigdata_24032026_init/embeddings/minilm_game_text_features \
-  --batch_size 128
-"""
-
 import argparse
 import math
 import os

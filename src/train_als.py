@@ -158,6 +158,7 @@ def main():
 
     print(f"Generating Top-{args.top_k} recommendations for {args.user_limit} users...")
 
+    # Dự đoán cho user demo
     recs = model.recommendForUserSubset(demo_users, args.top_k)
 
     exploded = (
@@ -218,7 +219,7 @@ def main():
     )
 
     print(f"Writing recommendations to: {args.output_path}")
-
+    # chia phân mảnh và ghi dữ liệu lại gg cloud storage
     (
         result
         .repartition(32)
